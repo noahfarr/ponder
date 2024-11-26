@@ -65,9 +65,9 @@ class Args:
     """the frequency of training policy (delayed)"""
     noise_clip: float = 0.5
     """noise clip parameter of the Target Policy Smoothing Regularization"""
-    prediction_horizon: int = 10
+    prediction_horizon: int = 1
     """the prediction horizon of the model"""
-    gradient_steps: int = 4
+    gradient_steps: int = 1
 
 
 def make_env(env_id, seed, idx, capture_video, run_name):
@@ -368,24 +368,25 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                     final_next_observations,
                     final_rewards,
                 ) = trajectory[args.prediction_horizon]
-                qf1_a_values = torch.zeros((args.prediction_horizon, args.batch_size))
-                next_q_values = torch.zeros((args.prediction_horizon, args.batch_size))
+                H = args.prediction_horizon + 1
+                qf1_a_values = torch.zeros((H, args.batch_size))
+                next_q_values = torch.zeros((H, args.batch_size))
                 observations, actions, next_observations, rewards = zip(*trajectory)
-                for t in range(args.prediction_horizon):
+                for t in range(H):
                     with torch.no_grad():
                         discounted_rewards = sum(
                             args.gamma ** (k - t) * rewards[k].flatten()
-                            for k in range(t, args.prediction_horizon)
+                            for k in range(t, H)
                         )
-                        next_state_actions = target_actor(next_observations[t])
+                        next_actions = target_actor(next_observations[t])
 
                         qf1_next_target = qf1_target(
                             next_observations[t],
-                            next_state_actions,
+                            next_actions,
                         ).view(-1)
-                        next_q_values[t] = discounted_rewards + args.gamma ** (
-                            args.prediction_horizon + 1
-                        ) * (qf1_next_target).view(-1)
+                        next_q_values[t] = discounted_rewards + args.gamma ** (H) * (
+                            qf1_next_target
+                        )
 
                     qf1_a_values[t] = qf1(observations[t], actions[t]).view(-1)
                 qf1_loss = F.mse_loss(qf1_a_values, next_q_values)
