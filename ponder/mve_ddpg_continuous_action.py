@@ -367,19 +367,15 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                     final_actions,
                     final_next_observations,
                     final_rewards,
-                ) = trajectory[-1]
-                qf1_a_values = torch.zeros(
-                    (args.prediction_horizon + 1, args.batch_size)
-                )
-                next_q_values = torch.zeros(
-                    (args.prediction_horizon + 1, args.batch_size)
-                )
+                ) = trajectory[args.prediction_horizon]
+                qf1_a_values = torch.zeros((args.prediction_horizon, args.batch_size))
+                next_q_values = torch.zeros((args.prediction_horizon, args.batch_size))
                 observations, actions, next_observations, rewards = zip(*trajectory)
-                for t in range(args.prediction_horizon + 1):
+                for t in range(args.prediction_horizon):
                     with torch.no_grad():
                         discounted_rewards = sum(
                             args.gamma ** (k - t) * rewards[k].flatten()
-                            for k in range(t, args.prediction_horizon + 1)
+                            for k in range(t, args.prediction_horizon)
                         )
                         next_state_actions = target_actor(next_observations[t])
 
