@@ -41,7 +41,7 @@ class Args:
     """the user or org name of the model repository from the Hugging Face Hub"""
 
     # Algorithm specific arguments
-    env_id: str = "Hopper-v4"
+    env_id: str = "HalfCheetah-v4"
     """the environment id of the Atari game"""
     total_timesteps: int = 1000000
     """total timesteps of the experiments"""
