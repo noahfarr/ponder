@@ -53,7 +53,7 @@ class Args:
     """the discount factor gamma"""
     tau: float = 0.005
     """target smoothing coefficient (default: 0.005)"""
-    batch_size: int = 512
+    batch_size: int = 256
     """the batch size of sample from the reply memory"""
     exploration_noise: float = 0.1
     """the scale of exploration noise"""
@@ -65,9 +65,9 @@ class Args:
     """the frequency of training policy (delayed)"""
     noise_clip: float = 0.5
     """noise clip parameter of the Target Policy Smoothing Regularization"""
-    prediction_horizon: int = 1
+    prediction_horizon: int = 2
     """the prediction horizon of the model"""
-    gradient_steps: int = 1
+    gradient_steps: int = 4
 
 
 def make_env(env_id, seed, idx, capture_video, run_name):
@@ -192,18 +192,18 @@ class Ensemble(nn.Module):
     def forward(self, x, a):
         return torch.stack([model(x, a) for model in self.models])
 
-    def generate_trajectory(self, obs, prediction_horizon):
-        with torch.no_grad():
-            trajectory = []
-            for step in range(prediction_horizon):
-                model = random.choice(self.models)
-                actions = target_actor(obs)
-                next_obs = model(obs, actions)
-                rewards = half_cheetah_v4_reward(obs, actions, next_obs)
-                trajectory.append((obs, actions, next_obs, rewards))
-                obs = next_obs
-            return trajectory
-
+    def generate_trajectory(self, data, prediction_horizon):
+        trajectory = [
+            (data.observations, data.actions, data.next_observations, data.rewards)
+        ]
+        obs = data.next_observations
+        for step in range(prediction_horizon):
+            model = random.choice(self.models)
+            actions = target_actor(obs)
+            next_obs = model(obs, actions)
+            rewards = half_cheetah_v4_reward(obs, actions, next_obs)
+            trajectory.append((obs, actions, next_obs, rewards))
+            obs = next_obs
         return trajectory
 
 
@@ -351,52 +351,45 @@ poetry run pip install "stable_baselines3==2.0.0a1"
             for _ in range(args.gradient_steps):
                 data = rb.sample(args.batch_size)
 
-                trajectory = ensemble_model.generate_trajectory(
-                    data.next_observations, args.prediction_horizon
-                )
-                trajectory = [
-                    (
-                        data.observations,
-                        data.actions,
-                        data.next_observations,
-                        data.rewards,
+                with torch.no_grad():
+                    trajectory = ensemble_model.generate_trajectory(
+                        data, args.prediction_horizon
                     )
-                ] + trajectory
-                (
-                    final_observations,
-                    final_actions,
-                    final_next_observations,
-                    final_rewards,
-                ) = trajectory[args.prediction_horizon]
-                H = args.prediction_horizon + 1
-                qf1_a_values = torch.zeros((H, args.batch_size))
-                next_q_values = torch.zeros((H, args.batch_size))
-                observations, actions, next_observations, rewards = zip(*trajectory)
-                for t in range(H):
+                    observations, actions, next_observations, rewards = zip(*trajectory)
+                    next_actions = target_actor(
+                        next_observations[args.prediction_horizon]
+                    )
+
+                    qf1_next_target = qf1_target(
+                        next_observations[args.prediction_horizon],
+                        next_actions,
+                    ).view(-1)
+
+                qf1_loss = 0
+                for t in range(0, args.prediction_horizon + 1):
                     with torch.no_grad():
                         discounted_rewards = sum(
-                            args.gamma ** (k - t) * rewards[k].flatten()
-                            for k in range(t, H)
-                        )
-                        next_actions = target_actor(next_observations[t])
-
-                        qf1_next_target = qf1_target(
-                            next_observations[t],
-                            next_actions,
-                        ).view(-1)
-                        next_q_values[t] = discounted_rewards + args.gamma ** (H) * (
-                            qf1_next_target
+                            [
+                                args.gamma ** (k - t) * rewards[k].flatten()
+                                for k in range(t, args.prediction_horizon + 1)
+                            ]
                         )
 
-                    qf1_a_values[t] = qf1(observations[t], actions[t]).view(-1)
-                qf1_loss = F.mse_loss(qf1_a_values, next_q_values)
+                        next_q_value = discounted_rewards + args.gamma ** (
+                            args.prediction_horizon + 1
+                        ) * (qf1_next_target)
+
+                    qf1_a_value = qf1(observations[t], actions[t]).view(-1)
+
+                    qf1_loss += torch.mse_loss(qf1_a_value, next_q_value)
 
                 # optimize the model
                 q_optimizer.zero_grad()
                 qf1_loss.backward()
                 q_optimizer.step()
 
-                if global_step % args.policy_frequency == 0:
+            if global_step % args.policy_frequency == 0:
+                for _ in range(args.gradient_steps):
                     actor_loss = -qf1(
                         data.observations, actor(data.observations)
                     ).mean()
@@ -404,27 +397,25 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                     actor_loss.backward()
                     actor_optimizer.step()
 
-                # update the target network
-                for param, target_param in zip(
-                    actor.parameters(), target_actor.parameters()
-                ):
-                    target_param.data.copy_(
-                        args.tau * param.data + (1 - args.tau) * target_param.data
-                    )
-                for param, target_param in zip(
-                    qf1.parameters(), qf1_target.parameters()
-                ):
-                    target_param.data.copy_(
-                        args.tau * param.data + (1 - args.tau) * target_param.data
-                    )
+            # update the target network
+            for param, target_param in zip(
+                actor.parameters(), target_actor.parameters()
+            ):
+                target_param.data.copy_(
+                    args.tau * param.data + (1 - args.tau) * target_param.data
+                )
+            for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
+                target_param.data.copy_(
+                    args.tau * param.data + (1 - args.tau) * target_param.data
+                )
 
             if global_step % 100 == 0:
-                writer.add_scalar(
-                    "losses/qf1_values", qf1_a_values.mean().item(), global_step
-                )
-                writer.add_scalar(
-                    "losses/next_q_values", next_q_values.mean().item(), global_step
-                )
+                # writer.add_scalar(
+                #     "losses/qf1_values", qf1_a_values.mean().item(), global_step
+                # )
+                # writer.add_scalar(
+                #     "losses/next_q_values", next_q_values.mean().item(), global_step
+                # )
                 writer.add_scalar("losses/qf1_loss", qf1_loss.item(), global_step)
                 writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
                 print("SPS:", int(global_step / (time.time() - start_time)))
