@@ -65,7 +65,7 @@ class Args:
     """the frequency of training policy (delayed)"""
     noise_clip: float = 0.5
     """noise clip parameter of the Target Policy Smoothing Regularization"""
-    prediction_horizon: int = 2
+    prediction_horizon: int = 10
     """the prediction horizon of the model"""
     gradient_steps: int = 4
 
@@ -90,8 +90,7 @@ def half_cheetah_v4_reward(obs, action, next_obs):
         next_x_pos = next_obs[:, 0]
         x_vel = (next_x_pos - x_pos) / 0.05
         forward_reward = x_vel
-
-        ctrl_cost = 0.1 * torch.sum(torch.square(action))
+        ctrl_cost = 0.1 * torch.sum(torch.square(action), dim=-1)
         reward = forward_reward - ctrl_cost
         return reward
 
@@ -189,15 +188,12 @@ class Ensemble(nn.Module):
         super().__init__()
         self.models = nn.ModuleList([Model(envs) for _ in range(num_models)])
 
-    def forward(self, x, a):
-        return torch.stack([model(x, a) for model in self.models])
-
     def generate_trajectory(self, data, prediction_horizon):
         trajectory = [
             (data.observations, data.actions, data.next_observations, data.rewards)
         ]
         obs = data.next_observations
-        for step in range(prediction_horizon):
+        for _ in range(prediction_horizon):
             model = random.choice(self.models)
             actions = target_actor(obs)
             next_obs = model(obs, actions)
@@ -261,8 +257,11 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     target_actor = Actor(envs).to(device)
     target_actor.load_state_dict(actor.state_dict())
     qf1_target.load_state_dict(qf1.state_dict())
-    q_optimizer = optim.Adam(list(qf1.parameters()), lr=args.learning_rate)
-    actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.learning_rate)
+    q_optimizer = optim.Adam(
+        qf1.parameters(),
+        lr=args.learning_rate,
+    )
+    actor_optimizer = optim.Adam(actor.parameters(), lr=args.learning_rate)
     ensemble_model_optimizers = [
         optim.Adam(model.parameters(), lr=args.learning_rate)
         for model in ensemble_model.models
@@ -327,21 +326,22 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 for _ in range(args.gradient_steps):
                     data = rb.sample(args.batch_size)
                     pred_next_obs = model(data.observations, data.actions)
+
                     model_loss = F.mse_loss(
                         pred_next_obs,
                         data.next_observations,
                     )
 
-                    if global_step % 100 == 0:
-                        writer.add_scalar(
-                            f"losses/model_loss_{model_idx}",
-                            model_loss.item(),
-                            global_step,
-                        )
-
                     model_optimizer.zero_grad()
                     model_loss.backward()
                     model_optimizer.step()
+
+                if global_step % 100 == 0:
+                    writer.add_scalar(
+                        f"losses/model_loss_{model_idx}",
+                        model_loss.item(),
+                        global_step,
+                    )
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
@@ -365,7 +365,12 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                         next_actions,
                     ).view(-1)
 
-                qf1_loss = 0
+                qf1_a_values = torch.zeros(
+                    (args.prediction_horizon + 1, args.batch_size)
+                )
+                next_q_values = torch.zeros(
+                    (args.prediction_horizon + 1, args.batch_size)
+                )
                 for t in range(0, args.prediction_horizon + 1):
                     with torch.no_grad():
                         discounted_rewards = sum(
@@ -375,21 +380,22 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                             ]
                         )
 
-                        next_q_value = discounted_rewards + args.gamma ** (
-                            args.prediction_horizon + 1
-                        ) * (qf1_next_target)
+                        next_q_values[t] = (
+                            discounted_rewards
+                            + args.gamma ** (args.prediction_horizon + 1)
+                            * qf1_next_target
+                        ).view(-1)
 
-                    qf1_a_value = qf1(observations[t], actions[t]).view(-1)
+                    qf1_a_values[t] = qf1(observations[t], actions[t]).view(-1)
 
-                    qf1_loss += torch.mse_loss(qf1_a_value, next_q_value)
+                qf1_loss = F.mse_loss(qf1_a_values, next_q_values)
 
-                # optimize the model
+                # Optimize the model
                 q_optimizer.zero_grad()
                 qf1_loss.backward()
                 q_optimizer.step()
 
-            if global_step % args.policy_frequency == 0:
-                for _ in range(args.gradient_steps):
+                if global_step % args.policy_frequency == 0:
                     actor_loss = -qf1(
                         data.observations, actor(data.observations)
                     ).mean()
@@ -410,12 +416,12 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 )
 
             if global_step % 100 == 0:
-                # writer.add_scalar(
-                #     "losses/qf1_values", qf1_a_values.mean().item(), global_step
-                # )
-                # writer.add_scalar(
-                #     "losses/next_q_values", next_q_values.mean().item(), global_step
-                # )
+                writer.add_scalar(
+                    "losses/qf1_values", qf1_a_values.mean().item(), global_step
+                )
+                writer.add_scalar(
+                    "losses/next_q_values", next_q_values.mean().item(), global_step
+                )
                 writer.add_scalar("losses/qf1_loss", qf1_loss.item(), global_step)
                 writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
                 print("SPS:", int(global_step / (time.time() - start_time)))
